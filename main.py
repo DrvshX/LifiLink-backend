@@ -41,7 +41,7 @@ app.add_middleware(
 # =========================
 # Uploads
 # =========================
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 PROFILE_IMAGE_DIR = os.path.join(UPLOAD_DIR, "profile_images")
 os.makedirs(PROFILE_IMAGE_DIR, exist_ok=True)
 
@@ -60,7 +60,7 @@ OTP_TTL_MIN = int(os.getenv("OTP_TTL_MIN", "10"))
 OTP_RESEND_COOLDOWN_SEC = int(os.getenv("OTP_RESEND_COOLDOWN_SEC", "60"))
 OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-now")
 JWT_ACCESS_TTL_MIN = int(os.getenv("JWT_ACCESS_TTL_MIN", "30"))
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -86,20 +86,35 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg2://carpool:carpoolpass@localhost:5432/carpooldb",
 )
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
 # =========================
 # Redis
 # =========================
-redis_enabled = True
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+
+redis_enabled = False
+rdb = None
+
 try:
-    rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    rdb.ping()
-    print(f"✅ Redis connected: {REDIS_URL}")
+    if REDIS_URL:
+        rdb = redis.Redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            retry_on_timeout=True,
+        )
+        rdb.ping()
+        redis_enabled = True
+        print(f"✅ Redis connected: {REDIS_URL}")
+    else:
+        print("⚠️ REDIS_URL not set. Using in-memory OTP store.")
 except Exception as e:
     redis_enabled = False
     rdb = None
-    print(f"⚠️ Redis not available, using in-memory OTP store. Error: {repr(e)}")
+    print(
+        f"⚠️ Redis not available, using in-memory OTP store. "
+        f"REDIS_URL={REDIS_URL} | Error: {repr(e)}"
+    )
 
 OTP_STORE = {}
 
@@ -220,7 +235,7 @@ def make_access_token(email: str, role: str) -> str:
 
 def resend_send_email(to_email: str, subject: str, html: str):
     if not RESEND_API_KEY:
-        raise RuntimeError("RESEND_API_KEY missing in .env")
+        raise RuntimeError("RESEND_API_KEY missing in environment variables")
     resend.api_key = RESEND_API_KEY
 
     payload = {
@@ -334,11 +349,14 @@ def request_otp(body: RequestOtpBody):
     email = body.email.lower().strip()
 
     if not is_college_email(email):
-        raise HTTPException(status_code=403, detail="Only Xavier college email IDs are allowed.")
+        raise HTTPException(
+            status_code=403,
+            detail="Only Xavier college email IDs are allowed.",
+        )
 
     otp = f"{random.randint(0, 999999):06d}"
 
-    if redis_enabled:
+    if redis_enabled and rdb is not None:
         if rdb.exists(cooldown_key(email)):
             ttl = rdb.ttl(cooldown_key(email))
             raise HTTPException(
@@ -378,7 +396,7 @@ def request_otp(body: RequestOtpBody):
         resp = send_otp_email(email, otp, OTP_TTL_MIN)
         print("✅ Resend response:", resp)
     except Exception as e:
-        if redis_enabled:
+        if redis_enabled and rdb is not None:
             rdb.delete(otp_key(email))
             rdb.delete(cooldown_key(email))
         else:
@@ -393,7 +411,7 @@ def verify_otp(body: VerifyOtpBody, db: Session = Depends(get_db)):
     email = body.email.lower().strip()
     otp = body.otp.strip()
 
-    if redis_enabled:
+    if redis_enabled and rdb is not None:
         record = rdb.hgetall(otp_key(email))
         if not record:
             raise HTTPException(status_code=400, detail="OTP not found. Request OTP again.")
