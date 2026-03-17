@@ -1,9 +1,11 @@
 fastapi
 uvicorn[standard]
 python-dotenv
-pyjwt
+PyJWT
 resend
 redis
 sqlalchemy
 psycopg2-binary
 pydantic
+email-validator
+python-multipart
