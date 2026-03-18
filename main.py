@@ -281,6 +281,47 @@ def cooldown_key(email: str) -> str:
     return f"otp_cd:{email}"
 
 
+def serialize_ride(ride: Ride, current_user_email: str, db: Session):
+    driver_profile = db.query(User).filter(User.email == ride.driver_email).first()
+
+    passenger_details = []
+    passenger_emails = []
+
+    for p in ride.passengers:
+        passenger_emails.append(p.passenger_email)
+        passenger_profile = db.query(User).filter(User.email == p.passenger_email).first()
+
+        passenger_details.append({
+            "email": p.passenger_email,
+            "phone_number": passenger_profile.phone_number if passenger_profile else "",
+            "full_name": passenger_profile.full_name if passenger_profile else "",
+        })
+
+    return {
+        "ride_id": ride.ride_id,
+        "id": ride.ride_id,
+        "driver_email": ride.driver_email,
+        "driver_role": ride.driver_role,
+        "driver_phone_number": driver_profile.phone_number if driver_profile else "",
+        "driver_phone": driver_profile.phone_number if driver_profile else "",
+        "driver_full_name": driver_profile.full_name if driver_profile else "",
+        "driver_name": driver_profile.full_name if driver_profile else "",
+        "from_location": ride.from_location,
+        "to_location": ride.to_location,
+        "departure_time": ride.departure_time.isoformat(),
+        "seats_total": ride.seats_total,
+        "seat_taken": ride.seat_taken,
+        "seat_left": ride.seat_left,
+        "seats_left": ride.seat_left,
+        "available_seats": ride.seat_left,
+        "notes": ride.notes,
+        "created_at": ride.created_at.isoformat(),
+        "is_driver": ride.driver_email == current_user_email,
+        "is_joined": current_user_email in passenger_emails,
+        "passengers": passenger_details,
+    }
+
+
 # =========================
 # Auth
 # =========================
@@ -512,7 +553,23 @@ def update_profile(
     db.commit()
     db.refresh(profile)
 
-    return {"status": "profile_updated"}
+    return {
+        "status": "profile_updated",
+        "profile": {
+            "email": profile.email,
+            "role": profile.role,
+            "full_name": profile.full_name,
+            "phone_number": profile.phone_number,
+            "department": profile.department,
+            "address": profile.address,
+            "emergency_contact_name": profile.emergency_contact_name,
+            "emergency_contact_phone": profile.emergency_contact_phone,
+            "profile_image_url": profile.profile_image_url,
+            "last_ride_id": profile.last_ride_id,
+            "created_at": profile.created_at.isoformat(),
+            "updated_at": profile.updated_at.isoformat(),
+        },
+    }
 
 
 @app.post("/profile/upload-image")
@@ -568,15 +625,18 @@ def create_ride(
     ride_id = f"ride_{int(time.time())}_{random.randint(1000, 9999)}"
     seats_total = body.seats_total
 
+    if seats_total < 1:
+        raise HTTPException(status_code=400, detail="seats_total must be at least 1")
+
     ride = Ride(
         ride_id=ride_id,
         driver_email=user["email"],
         driver_role=user["role"],
-        from_location=body.from_location,
-        to_location=body.to_location,
+        from_location=body.from_location.strip(),
+        to_location=body.to_location.strip(),
         departure_time=body.departure_time.astimezone(timezone.utc),
         seats_total=seats_total,
-        notes=body.notes or "",
+        notes=(body.notes or "").strip(),
         seat_taken=0,
         seat_left=seats_total,
     )
@@ -589,7 +649,12 @@ def create_ride(
         profile.updated_at = datetime.now(timezone.utc)
 
     db.commit()
-    return {"ride_id": ride_id}
+    db.refresh(ride)
+
+    return {
+        "status": "ride_created",
+        "ride": serialize_ride(ride, user["email"], db),
+    }
 
 
 @app.get("/rides/search")
@@ -602,55 +667,31 @@ def search_rides(
 ):
     query = db.query(Ride)
 
-    if from_location:
-        query = query.filter(Ride.from_location.ilike(f"%{from_location}%"))
-    if to_location:
-        query = query.filter(Ride.to_location.ilike(f"%{to_location}%"))
+    if from_location and from_location.strip():
+        query = query.filter(Ride.from_location.ilike(f"%{from_location.strip()}%"))
+
+    if to_location and to_location.strip():
+        query = query.filter(Ride.to_location.ilike(f"%{to_location.strip()}%"))
+
     if after:
         query = query.filter(Ride.departure_time >= after.astimezone(timezone.utc))
 
     ride_list = query.order_by(Ride.created_at.desc()).all()
 
-    results = []
-    for ride in ride_list:
-        driver_profile = db.query(User).filter(User.email == ride.driver_email).first()
+    results = [serialize_ride(ride, user["email"], db) for ride in ride_list]
 
-        passenger_details = []
-        passenger_emails = []
-
-        for p in ride.passengers:
-            passenger_emails.append(p.passenger_email)
-            passenger_profile = db.query(User).filter(User.email == p.passenger_email).first()
-            passenger_details.append({
-                "email": p.passenger_email,
-                "phone_number": passenger_profile.phone_number if passenger_profile else "",
-                "full_name": passenger_profile.full_name if passenger_profile else "",
-            })
-
-        results.append({
-            "ride_id": ride.ride_id,
-            "driver_email": ride.driver_email,
-            "driver_role": ride.driver_role,
-            "driver_phone_number": driver_profile.phone_number if driver_profile else "",
-            "driver_full_name": driver_profile.full_name if driver_profile else "",
-            "from_location": ride.from_location,
-            "to_location": ride.to_location,
-            "departure_time": ride.departure_time.isoformat(),
-            "seats_total": ride.seats_total,
-            "seat_taken": ride.seat_taken,
-            "seat_left": ride.seat_left,
-            "notes": ride.notes,
-            "created_at": ride.created_at.isoformat(),
-            "is_driver": ride.driver_email == user["email"],
-            "is_joined": user["email"] in passenger_emails,
-            "passengers": passenger_details,
-        })
-
-    return {"rides": results}
+    return {
+        "count": len(results),
+        "rides": results,
+    }
 
 
 @app.post("/rides/{ride_id}/join")
-def join_ride(ride_id: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def join_ride(
+    ride_id: str,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     ride = db.query(Ride).filter(Ride.ride_id == ride_id).first()
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found")
@@ -687,11 +728,20 @@ def join_ride(ride_id: str, user=Depends(get_current_user), db: Session = Depend
         profile.updated_at = datetime.now(timezone.utc)
 
     db.commit()
-    return {"status": "joined", "ride_id": ride_id, "seat_left": ride.seat_left}
+    db.refresh(ride)
+
+    return {
+        "status": "joined",
+        "ride": serialize_ride(ride, user["email"], db),
+    }
 
 
 @app.post("/rides/{ride_id}/leave")
-def leave_ride(ride_id: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
+def leave_ride(
+    ride_id: str,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     ride = db.query(Ride).filter(Ride.ride_id == ride_id).first()
     if not ride:
         raise HTTPException(status_code=404, detail="Ride not found")
@@ -712,4 +762,9 @@ def leave_ride(ride_id: str, user=Depends(get_current_user), db: Session = Depen
     ride.seat_left = max(0, ride.seats_total - ride.seat_taken)
 
     db.commit()
-    return {"status": "left", "ride_id": ride_id, "seat_left": ride.seat_left}
+    db.refresh(ride)
+
+    return {
+        "status": "left",
+        "ride": serialize_ride(ride, user["email"], db),
+    }
