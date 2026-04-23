@@ -24,6 +24,7 @@ from sqlalchemy import (
     ForeignKey,
     Boolean,
     Float,
+    text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
@@ -173,7 +174,156 @@ class OtpCode(Base):
     )
 
 
+def migrate_schema():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS role VARCHAR NOT NULL DEFAULT 'student'
+        """))
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS full_name VARCHAR NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS phone_number VARCHAR NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS department VARCHAR NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS address TEXT NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS emergency_contact_name VARCHAR NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS emergency_contact_phone VARCHAR NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS profile_image_url TEXT NOT NULL DEFAULT ''
+        """))
+
+        conn.execute(text("""
+            ALTER TABLE rides
+            ADD COLUMN IF NOT EXISTS driver_role VARCHAR NOT NULL DEFAULT 'student'
+        """))
+        conn.execute(text("""
+            ALTER TABLE rides
+            ADD COLUMN IF NOT EXISTS total_cost DOUBLE PRECISION NOT NULL DEFAULT 0.0
+        """))
+        conn.execute(text("""
+            ALTER TABLE rides
+            ADD COLUMN IF NOT EXISTS allowed_role VARCHAR NOT NULL DEFAULT 'all'
+        """))
+        conn.execute(text("""
+            ALTER TABLE rides
+            ADD COLUMN IF NOT EXISTS status VARCHAR NOT NULL DEFAULT 'scheduled'
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS recent_rides (
+                id SERIAL PRIMARY KEY,
+                user_email VARCHAR NOT NULL,
+                from_location VARCHAR NOT NULL,
+                to_location VARCHAR NOT NULL,
+                used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS otp_codes (
+                email VARCHAR PRIMARY KEY,
+                otp_hash VARCHAR NOT NULL,
+                role VARCHAR NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                expires_at TIMESTAMPTZ NOT NULL,
+                last_sent_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id SERIAL PRIMARY KEY,
+                user_email VARCHAR NOT NULL,
+                title VARCHAR NOT NULL,
+                message TEXT NOT NULL,
+                type VARCHAR NOT NULL DEFAULT 'general',
+                is_read BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+
+        conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS id BIGSERIAL
+        """))
+        conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS user_email VARCHAR NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS title VARCHAR NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS message TEXT NOT NULL DEFAULT ''
+        """))
+        conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS type VARCHAR NOT NULL DEFAULT 'general'
+        """))
+        conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS is_read BOOLEAN NOT NULL DEFAULT FALSE
+        """))
+        conn.execute(text("""
+            ALTER TABLE notifications
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        """))
+
+        conn.execute(text("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'notifications_pkey'
+                ) THEN
+                    ALTER TABLE notifications
+                    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
+                END IF;
+            EXCEPTION
+                WHEN duplicate_table THEN NULL;
+                WHEN duplicate_object THEN NULL;
+            END $$;
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_notifications_user_email
+            ON notifications (user_email)
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_recent_rides_user_email
+            ON recent_rides (user_email)
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_otp_codes_email
+            ON otp_codes (email)
+        """))
+
+
 Base.metadata.create_all(bind=engine)
+migrate_schema()
 print("✅ Postgres tables ready.")
 
 
@@ -188,7 +338,7 @@ def get_db() -> Generator[Session, None, None]:
 def detect_role_from_email(email: str) -> str:
     if email.endswith(f"@{STUDENT_DOMAIN}"):
         return "student"
-    if email.endswith(f"@{FACULTY_DOMAIN}"):
+    if email.endswith(f"@{FACULTY_DOMAIN}") and not email.endswith(f"@{STUDENT_DOMAIN}"):
         return "faculty"
     return "unknown"
 
@@ -198,8 +348,7 @@ def is_allowed_email(email: str) -> bool:
 
 
 def validate_role_with_email(email: str, selected_role: str) -> bool:
-    actual = detect_role_from_email(email)
-    return actual == selected_role
+    return detect_role_from_email(email) == selected_role
 
 
 def hash_otp(email: str, otp: str) -> str:
@@ -408,10 +557,10 @@ def verify_otp(body: VerifyOtpBody, db: Session = Depends(get_db)):
         db.commit()
         raise HTTPException(status_code=429, detail="Too many attempts.")
 
-    record.attempts += 1
-    db.commit()
-
-    if hash_otp(email, otp) != record.otp_hash:
+    expected_hash = hash_otp(email, otp)
+    if expected_hash != record.otp_hash:
+        record.attempts += 1
+        db.commit()
         raise HTTPException(status_code=400, detail="Invalid OTP.")
 
     role = detect_role_from_email(email)
