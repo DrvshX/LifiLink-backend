@@ -8,7 +8,6 @@ from typing import Optional, Generator
 
 import jwt
 import resend
-import redis
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,31 +63,6 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg2://carpool:carpoolpass@localhost:5432/carpooldb",
 )
 
-REDIS_URL = os.getenv("REDIS_URL", "").strip()
-redis_enabled = False
-rdb = None
-
-try:
-    if REDIS_URL:
-        rdb = redis.Redis.from_url(
-            REDIS_URL,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-            retry_on_timeout=True,
-        )
-        rdb.ping()
-        redis_enabled = True
-        print("✅ Redis connected")
-    else:
-        print("⚠️ REDIS_URL not set. Using in-memory OTP store.")
-except Exception as e:
-    redis_enabled = False
-    rdb = None
-    print(f"⚠️ Redis not available, using in-memory OTP store. Error: {repr(e)}")
-
-OTP_STORE = {}
-
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
@@ -98,7 +72,7 @@ class User(Base):
     __tablename__ = "users"
 
     email = Column(String, primary_key=True, index=True)
-    role = Column(String, nullable=False)
+    role = Column(String, nullable=False, default="student")
     full_name = Column(String, nullable=False, default="")
     phone_number = Column(String, nullable=False, default="")
     department = Column(String, nullable=False, default="")
@@ -123,7 +97,7 @@ class Ride(Base):
 
     ride_id = Column(String, primary_key=True, index=True)
     driver_email = Column(String, ForeignKey("users.email"), nullable=False)
-    driver_role = Column(String, nullable=False)
+    driver_role = Column(String, nullable=False, default="student")
     from_location = Column(String, nullable=False)
     to_location = Column(String, nullable=False)
     departure_time = Column(DateTime(timezone=True), nullable=False)
@@ -183,6 +157,22 @@ class RecentRide(Base):
     )
 
 
+class OtpCode(Base):
+    __tablename__ = "otp_codes"
+
+    email = Column(String, primary_key=True, index=True)
+    otp_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    last_sent_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
 Base.metadata.create_all(bind=engine)
 print("✅ Postgres tables ready.")
 
@@ -226,14 +216,6 @@ def make_access_token(email: str, role: str) -> str:
         "exp": int((now + timedelta(minutes=JWT_ACCESS_TTL_MIN)).timestamp()),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-
-def otp_key(email: str) -> str:
-    return f"otp:{email}"
-
-
-def cooldown_key(email: str) -> str:
-    return f"otp_cd:{email}"
 
 
 def send_otp_email(email: str, otp: str):
@@ -352,7 +334,7 @@ def root():
 
 
 @app.post("/auth/request-otp")
-def request_otp(body: RequestOtpBody):
+def request_otp(body: RequestOtpBody, db: Session = Depends(get_db)):
     email = body.email.lower().strip()
     role = body.role.lower().strip()
 
@@ -365,35 +347,37 @@ def request_otp(body: RequestOtpBody):
             detail="Selected role does not match institutional email.",
         )
 
+    existing = db.query(OtpCode).filter(OtpCode.email == email).first()
+    now = datetime.now(timezone.utc)
+
+    if existing:
+        seconds_since_last = (now - existing.last_sent_at).total_seconds()
+        if seconds_since_last < OTP_RESEND_COOLDOWN_SEC:
+            wait = int(OTP_RESEND_COOLDOWN_SEC - seconds_since_last)
+            raise HTTPException(status_code=429, detail=f"Wait {max(wait, 1)} seconds.")
+
     otp = f"{random.randint(0, 999999):06d}"
+    otp_hash = hash_otp(email, otp)
 
-    if redis_enabled and rdb is not None:
-        if rdb.exists(cooldown_key(email)):
-            ttl = rdb.ttl(cooldown_key(email))
-            raise HTTPException(status_code=429, detail=f"Wait {max(ttl, 1)} seconds.")
-
-        rdb.hset(
-            otp_key(email),
-            mapping={
-                "otp_hash": hash_otp(email, otp),
-                "attempts": 0,
-            },
-        )
-        rdb.expire(otp_key(email), OTP_TTL_MIN * 60)
-        rdb.setex(cooldown_key(email), OTP_RESEND_COOLDOWN_SEC, "1")
+    if existing:
+        existing.otp_hash = otp_hash
+        existing.role = role
+        existing.attempts = 0
+        existing.expires_at = now + timedelta(minutes=OTP_TTL_MIN)
+        existing.last_sent_at = now
     else:
-        now = time.time()
-        existing = OTP_STORE.get(email)
-        if existing and (now - existing["last_sent_ts"] < OTP_RESEND_COOLDOWN_SEC):
-            wait = int(OTP_RESEND_COOLDOWN_SEC - (now - existing["last_sent_ts"]))
-            raise HTTPException(status_code=429, detail=f"Wait {wait} seconds.")
+        db.add(
+            OtpCode(
+                email=email,
+                otp_hash=otp_hash,
+                role=role,
+                attempts=0,
+                expires_at=now + timedelta(minutes=OTP_TTL_MIN),
+                last_sent_at=now,
+            )
+        )
 
-        OTP_STORE[email] = {
-            "otp_hash": hash_otp(email, otp),
-            "expires_at": now + OTP_TTL_MIN * 60,
-            "attempts": 0,
-            "last_sent_ts": now,
-        }
+    db.commit()
 
     try:
         send_otp_email(email, otp)
@@ -408,46 +392,45 @@ def verify_otp(body: VerifyOtpBody, db: Session = Depends(get_db)):
     email = body.email.lower().strip()
     otp = body.otp.strip()
 
-    if redis_enabled and rdb is not None:
-        record = rdb.hgetall(otp_key(email))
-        if not record:
-            raise HTTPException(status_code=400, detail="OTP not found.")
+    record = db.query(OtpCode).filter(OtpCode.email == email).first()
+    if not record:
+        raise HTTPException(status_code=400, detail="OTP not found.")
 
-        attempts = int(record.get("attempts", 0))
-        if attempts >= OTP_MAX_ATTEMPTS:
-            rdb.delete(otp_key(email))
-            raise HTTPException(status_code=429, detail="Too many attempts.")
+    now = datetime.now(timezone.utc)
 
-        rdb.hincrby(otp_key(email), "attempts", 1)
+    if now > record.expires_at:
+        db.delete(record)
+        db.commit()
+        raise HTTPException(status_code=400, detail="OTP expired.")
 
-        if hash_otp(email, otp) != record.get("otp_hash"):
-            raise HTTPException(status_code=400, detail="Invalid OTP.")
+    if record.attempts >= OTP_MAX_ATTEMPTS:
+        db.delete(record)
+        db.commit()
+        raise HTTPException(status_code=429, detail="Too many attempts.")
 
-        rdb.delete(otp_key(email))
-    else:
-        record = OTP_STORE.get(email)
-        if not record:
-            raise HTTPException(status_code=400, detail="OTP not found.")
+    record.attempts += 1
+    db.commit()
 
-        if time.time() > record["expires_at"]:
-            OTP_STORE.pop(email, None)
-            raise HTTPException(status_code=400, detail="OTP expired.")
-
-        record["attempts"] += 1
-        if hash_otp(email, otp) != record["otp_hash"]:
-            raise HTTPException(status_code=400, detail="Invalid OTP.")
-
-        OTP_STORE.pop(email, None)
+    if hash_otp(email, otp) != record.otp_hash:
+        raise HTTPException(status_code=400, detail="Invalid OTP.")
 
     role = detect_role_from_email(email)
     if role == "unknown":
+        db.delete(record)
+        db.commit()
         raise HTTPException(status_code=400, detail="Invalid user role.")
+
+    db.delete(record)
+    db.commit()
 
     user = db.query(User).filter(User.email == email).first()
     if not user:
         user = User(email=email, role=role)
         db.add(user)
-        db.commit()
+    else:
+        user.role = role
+        user.updated_at = now
+    db.commit()
 
     token = make_access_token(email, role)
     return {
