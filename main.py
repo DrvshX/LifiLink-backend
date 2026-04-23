@@ -209,7 +209,6 @@ def migrate_schema():
             ADD COLUMN IF NOT EXISTS profile_image_url TEXT NOT NULL DEFAULT ''
         """))
 
-        # Fix old legacy schema if it exists
         conn.execute(text("""
             DO $$
             BEGIN
@@ -224,13 +223,10 @@ def migrate_schema():
                     EXCEPTION WHEN others THEN
                         NULL;
                     END;
+
+                    ALTER TABLE users DROP COLUMN last_ride_id CASCADE;
                 END IF;
             END $$;
-        """))
-
-        conn.execute(text("""
-            ALTER TABLE users
-            DROP COLUMN IF EXISTS last_ride_id CASCADE
         """))
 
         conn.execute(text("""
